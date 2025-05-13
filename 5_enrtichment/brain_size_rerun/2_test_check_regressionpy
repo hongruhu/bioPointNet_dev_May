@@ -1,0 +1,1313 @@
+# (mil) hongruhu@gpu-5-50:/group/gquongrp/workspaces/hongruhu/bioPointNet$
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+from anndata import AnnData
+import matplotlib.pyplot as plt
+import seaborn as sns
+from bioPointNet_Apr2025 import *
+
+obj = torch.load('/group/gquongrp/workspaces/hongruhu/bioPointNet/organism_level/species_protein_embedding.pt')
+len(obj.keys()) # 131
+gene_map = torch.load('/group/gquongrp/workspaces/hongruhu/bioPointNet/organism_level/species_protein_name.pt')
+gene_map = {x.split('_')[0]: v for x, v in gene_map.items()}
+
+
+df_brainsize = pd.read_csv('/group/gquongrp/workspaces/hongruhu/bioPointNet/organism_level/log_brain_mass_labels.csv', index_col=0)
+df_brainsize    # [131 rows x 4 columns]
+
+species_meta = pd.read_csv('/group/gquongrp/workspaces/hongruhu/bioPointNet/organism_level/species_id.csv', index_col=0)
+df_brainsize['size_order'] = df_brainsize['log_brain_mass'].rank(method='dense') - 1
+fig = plt.figure(figsize=(10, 5))
+sns.histplot(df_brainsize['size_order'], bins=20)
+plt.xlabel('size_order')
+plt.ylabel('Frequency')
+plt.title('Distribution of size_order')
+plt.show()
+fig.savefig('brainsize_distribution_rank.png')
+
+ins_all = [obj[k].shape[0] for k in obj.keys()]
+
+np.corrcoef(ins_all, df_brainsize['log_brain_mass']) # 0.000000
+# array([[1.        , 0.27450154],
+#        [0.27450154, 1.        ]])
+np.corrcoef(ins_all, df_brainsize['size_order']) # 0.000000
+# array([[1.        , 0.27006757],
+#        [0.27006757, 1.        ]])
+df_brainsize['size_order'] = df_brainsize['log_brain_mass'].copy()
+
+
+
+
+fold = 9
+
+
+
+train_idx = df_brainsize[df_brainsize['fold'] != fold].index
+val_idx = df_brainsize[df_brainsize['fold'] == fold].index
+train_obj = {k: obj[k] for k in train_idx}
+val_obj = {k: obj[k] for k in val_idx}
+train_labels = df_brainsize.loc[train_idx, 'size_order']
+val_labels = df_brainsize.loc[val_idx, 'size_order']
+
+pn_cls_checkpoint = torch.load('./brain_mass_res_regress/' + str(fold) + "_regression_brainsize.pt")
+device = "cpu"
+def MIL_Collate_fn(batch):
+    """
+    Custom collate function for MIL datasets: pads bags to the same length.
+    Args:
+        batch (list): List of tuples (bag, label) from the dataset.
+    Returns:
+        padded_bags (torch.Tensor): Padded bags of shape (batch_size, max_instances, num_features).
+        labels (torch.Tensor): Labels of shape (batch_size, num_classes).
+        lengths (torch.Tensor): Lengths of each bag in the batch, shape (batch_size,).
+    """
+    bags, labels, ins, metadata_idx= zip(*batch)
+    lengths = ins
+    max_length = max(ins)                            # Maximum number of instances in the batch
+    # Pad bags to the same length
+    padded_bags = torch.zeros((len(bags), max_length, bags[0].shape[1]), dtype=torch.float32)
+    for i, bag in enumerate(bags):
+        padded_bags[i, :len(bag)] = bag
+    labels = torch.stack(labels)        # Stack labels into a single tensor
+    return padded_bags.to(device), labels.to(device), lengths, metadata_idx
+
+
+Xs_tr = [torch.tensor(train_obj[k]) for k in train_obj.keys()]
+Ys_tr = torch.tensor(train_labels.tolist()).reshape(-1, 1)
+ins_tr = [Xs_tr[i].shape[0] for i in range(len(Xs_tr))]
+tr_dataset = MILDataset(Xs_tr, Ys_tr, ins_tr, train_labels.index.tolist())
+train_loader_ = DataLoader(tr_dataset, batch_size=len(tr_dataset), shuffle=False, collate_fn=MIL_Collate_fn)
+for tr_padded_bags, tr_labels, tr_lengths, tr_id in train_loader_:
+        print(len(tr_lengths))
+
+
+pred_label_tr_list = []
+true_label_tr_list = []
+instance_level_list = []
+cell_id_list = []
+attention_mtx_list = []
+pn_cls_checkpoint.to(device)
+for tr_idx in range(len(tr_lengths)):
+        tr_length = tr_lengths[tr_idx]
+        if tr_length <= 1:
+            continue
+        else:
+            input_tr = tr_padded_bags[tr_idx, :tr_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_tr, _, _, attn_weights_tr, _ = pn_cls_checkpoint(input_tr)
+            pred_label_tr = cls_tr
+            true_label_tr = tr_labels[tr_idx]
+            pred_label_tr_list.append(pred_label_tr.detach().cpu().numpy())
+            true_label_tr_list.append(true_label_tr.detach().cpu().numpy())
+            instance_level_list.append(input_tr.squeeze(0).permute(1,0).detach().cpu().numpy())
+            attention_mtx_list.append(attn_weights_tr.squeeze(0,1).detach().cpu().numpy())
+            cell_id_list.append(tr_id[tr_idx])
+
+
+true_label_tr_df = pd.DataFrame(np.vstack(true_label_tr_list), columns=['brainsize'], index=tr_id)
+pred_label_tr_df = pd.DataFrame(np.vstack(pred_label_tr_list), columns=['brainsize'], index=tr_id)
+true_label_tr_df['brainsize'] = df_brainsize.loc[true_label_tr_df.index, 'log_brain_mass']
+gene_id_list = [gene_map[i] for i in cell_id_list]
+mismatching_species = []
+for bag_id_tr in range(len(gene_id_list)):
+    if len(gene_id_list[bag_id_tr]) != len(instance_level_list[bag_id_tr]):
+        mismatching_species.append(bag_id_tr)    
+        print(cell_id_list[bag_id_tr], len(gene_id_list[bag_id_tr])-len(instance_level_list[bag_id_tr]))
+
+
+
+filtered_gene_id_list = [item for idx, item in enumerate(gene_id_list) if idx not in mismatching_species]
+filtered_instance_level_list = [item for idx, item in enumerate(instance_level_list) if idx not in mismatching_species]
+filtered_attention_mtx_list = [item for idx, item in enumerate(attention_mtx_list) if idx not in mismatching_species]
+[len(x) for x in filtered_gene_id_list] == [len(x) for x in filtered_instance_level_list]
+instance_mtx = np.vstack(filtered_instance_level_list) # (1833547, 320)
+gene_id_df = pd.DataFrame([i for sublist in filtered_gene_id_list for i in sublist], columns=["gene_id"])
+
+attention_mtx_df = pd.read_csv('./brain_mass_res_regress/' + str(fold) + "_attention_tr.csv", index_col=0)
+
+
+
+human_attention_mtx_df = attention_mtx_df[attention_mtx_df.species_id=='UP000005640']
+human_df = pd.read_csv('human_df.csv', index_col=0)
+
+
+species_info = species_meta[['Pheno Name', 'Uniprot Name']]
+species_id_to_name = species_info['Pheno Name'].to_dict()
+# filtered_instance_level_list    # input instance matrix list
+# filtered_gene_id_list           # input instance name list
+print(len(filtered_instance_level_list), len(filtered_gene_id_list))
+# 115 115
+# input bag list?
+mismatching_species # [1, 54, 81]
+true_label_tr_df # 118
+pred_label_tr_df # 118
+filtered_true_label = true_label_tr_df.drop(true_label_tr_df.index[mismatching_species])
+filtered_pred_label = pred_label_tr_df.drop(pred_label_tr_df.index[mismatching_species])
+filtered_true_label['species'] = filtered_true_label.index.map(species_id_to_name)
+filtered_pred_label['species'] = filtered_pred_label.index.map(species_id_to_name)
+filtered_true_label.to_csv('true.csv')
+filtered_pred_label.to_csv('pred.csv')
+np.sum(filtered_true_label.species == filtered_pred_label.species) # 115
+species_keys = filtered_true_label.species.tolist()
+
+
+target_species = 'human'
+species_keys.index(target_species) # 56
+eval_obj_initial = {target_species: filtered_instance_level_list[species_keys.index(target_species)]}
+eval_label_inital = filtered_pred_label.brainsize.tolist()[species_keys.index(target_species)]
+human_attention_mtx_df.shape    # (19854, 6)
+eval_obj_initial['human'].shape # (19854, 320)
+
+
+top_20_genes = human_df.index[-20:].tolist()
+bottom_20_genes = human_df.index[0:100].tolist()
+
+
+top20 = {}
+for g in top_20_genes:
+    if g in attention_mtx_df.index:
+        row_number = attention_mtx_df.index.get_loc(g)
+        print(row_number)
+    emb = instance_mtx[row_number].copy()
+    top20[g] = emb.copy().reshape(1,-1)
+
+
+bottom20 = {}
+for g in bottom_20_genes:
+    if g in attention_mtx_df.index:
+        row_number = attention_mtx_df.index.get_loc(g)
+        print(row_number)
+    emb = instance_mtx[row_number].copy()
+    bottom20[g] = emb.copy().reshape(1,-1)
+
+
+primate_true = filtered_true_label.iloc[[1, 5, 34, 42, 46, 48, 56, 63, 65, 70, 73]]
+primate_pred = filtered_pred_label.iloc[[1, 5, 34, 42, 46, 48, 56, 63, 65, 70, 73]]
+np.corrcoef(primate_true.brainsize, primate_pred.brainsize)
+# array([[1.        , 0.90370062],
+#        [0.90370062, 1.        ]])
+primate_true['pred_brainsize'] = primate_pred.brainsize
+
+
+
+human_initial_ids = list(human_attention_mtx_df.index[0:5])
+indices = [attention_mtx_df.index.get_loc(hid) for hid in human_initial_ids if hid in attention_mtx_df.index]
+indices # [878312, 878313, 878314, 878315, 878316], continuous, good
+
+
+row_idx = []
+for key in list(top20.keys()) + list(bottom20.keys()):
+    print(key)
+    row_num = human_attention_mtx_df.index.get_loc(key)
+    row_idx.append(row_num)
+
+
+
+import copy
+removed_eval_obj_dict = {}
+for i, idx_to_remove in enumerate(row_idx):
+    # Deep copy the initial dictionary
+    temp_eval_obj = copy.deepcopy(eval_obj_initial)
+    # Remove the corresponding row by slicing
+    temp_eval_mtx = np.delete(temp_eval_obj['human'], idx_to_remove, axis=0)
+    # Save into the new dictionary
+    removed_eval_obj_dict[f'remove_{i}'] = temp_eval_mtx
+
+
+len(removed_eval_obj_dict)
+# 120
+
+Xs_eval = [torch.tensor(removed_eval_obj_dict[k]) for k in removed_eval_obj_dict.keys()]
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+Ys_eval = torch.tensor([eval_label_inital]*len(removed_eval_obj_dict)).reshape(-1, 1)
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, list(top20.keys()) + list(bottom20.keys()))
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+
+removed_eval_obj_df = pd.DataFrame(np.vstack(pred_label_eval_list), index=list(top20.keys()) + list(bottom20.keys()))
+
+
+removed_eval_obj_df
+#                    0
+# Q63HR2      2.949944
+# O43157      2.949881
+# Q9H665      2.949827
+# O75064      2.949805
+# Q5SWA1      2.949838
+# ...              ...
+# Q9BZK8      2.950197
+# O75394      2.950144
+# A0A1B0GUT2  2.949767
+# Q9GZY1      2.950136
+# Q9NQZ3      2.951417
+
+
+
+
+start_y = 2.950236
+
+plt.figure(figsize=(10, 8))
+
+for i, (idx, row) in enumerate(removed_eval_obj_df.iterrows()):
+    end_y = row[0]
+    if i < 20:
+        color = 'red'  # First 20 lines
+    else:
+        color = 'grey'  # Rest lines
+    plt.plot([0, 1], [start_y, end_y], marker='o', color=color, alpha=0.2)
+
+plt.title('Line Plot for Each Row')
+plt.xlabel('Step')
+plt.ylabel('Value')
+plt.xticks([0, 1], ['Start', 'End'])
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('removed_eval_obj_lines_colored.pdf')
+plt.close()
+
+
+
+plt.figure(figsize=(10, 8))
+
+# Step 1: Draw all grey lines first
+for i, (idx, row) in enumerate(removed_eval_obj_df.iterrows()):
+    if i >= 20:
+        end_y = row[0]
+        plt.plot([0, 1], [start_y, end_y], marker='o', color='grey', zorder=1)
+
+# Step 2: Draw red lines afterward (on top)
+for i, (idx, row) in enumerate(removed_eval_obj_df.iterrows()):
+    if i < 20:
+        end_y = row[0]
+        plt.plot([0, 1], [start_y, end_y], marker='o', color='red', zorder=2)
+
+plt.title('Line Plot for Each Row (Red Lines on Top)')
+plt.xlabel('Step')
+plt.ylabel('Value')
+plt.xticks([0, 1], ['Start', 'End'])
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('removed_eval_obj_lines_red_on_top.pdf')
+plt.close()
+
+
+
+
+
+
+
+
+
+
+
+instance_mtx.shape     # (1833547, 320)
+attention_mtx_df.shape # (1833547, 6)
+human_df[human_df.gene_name=='WDR81'] # Q562E7 | Q562E7                    7.356374        human     WDR81
+if "Q562E7" in attention_mtx_df.index:
+    row_number = attention_mtx_df.index.get_loc("Q562E7")
+    print(row_number)
+    # 882033
+
+attention_mtx_df.iloc[row_number,:]
+# attention_score_raw                      0.000791
+# attention_score_zscore                   6.824608
+# attention_score_norm_norm               15.701357
+# species_id                            UP000005640
+# species_name                                human
+# species_Uniprot_name         homo sapiens (human)
+WDR81_emb = instance_mtx[row_number].copy()
+WDR81_emb = WDR81_emb.reshape(1,-1)
+
+
+# filtered_instance_level_list    # input instance matrix list
+# filtered_gene_id_list           # input instance name list
+print(len(filtered_instance_level_list), len(filtered_gene_id_list))
+# 115 115
+# input bag list?
+mismatching_species # [1, 54, 81]
+true_label_tr_df # 118
+pred_label_tr_df # 118
+filtered_true_label = true_label_tr_df.drop(true_label_tr_df.index[mismatching_species])
+filtered_pred_label = pred_label_tr_df.drop(pred_label_tr_df.index[mismatching_species])
+filtered_true_label['species'] = filtered_true_label.index.map(species_id_to_name)
+filtered_pred_label['species'] = filtered_pred_label.index.map(species_id_to_name)
+np.sum(filtered_true_label.species == filtered_pred_label.species) # 115
+species_keys = filtered_true_label.species.tolist()
+
+
+target_species = 'human'
+species_keys.index(target_species) # 56
+eval_obj_initial = {target_species: filtered_instance_level_list[species_keys.index(target_species)]}
+eval_label_inital = filtered_pred_label.brainsize.tolist()[species_keys.index(target_species)]
+human_attention_mtx_df.shape    # (19854, 6)
+eval_obj_initial['human'].shape # (19854, 320)
+
+
+top_20_genes = human_df.index[-20:].tolist()
+bottom_20_genes = human_df.index[0:100].tolist()
+
+
+top20 = {}
+for g in top_20_genes:
+    if g in attention_mtx_df.index:
+        row_number = attention_mtx_df.index.get_loc(g)
+        print(row_number)
+    emb = instance_mtx[row_number].copy()
+    top20[g] = emb.copy().reshape(1,-1)
+
+
+bottom20 = {}
+for g in bottom_20_genes:
+    if g in attention_mtx_df.index:
+        row_number = attention_mtx_df.index.get_loc(g)
+        print(row_number)
+    emb = instance_mtx[row_number].copy()
+    bottom20[g] = emb.copy().reshape(1,-1)
+
+
+
+import copy
+
+pred_res_top = pd.DataFrame(index=top_20_genes)
+pred_res_bottom = pd.DataFrame(index=bottom_20_genes)
+for dup in [1,2,3,4,5,10,25,50,100,250,500]:
+    top_eval_obj_dict = {}
+    for key in top20.keys():
+        temp_eval_mtx = np.vstack([eval_obj_initial['human'],
+                        np.repeat(top20[key], repeats=dup, axis=0)])
+        top_eval_obj_dict['human_' + key] = temp_eval_mtx
+    Xs_eval = [torch.tensor(top_eval_obj_dict[k]) for k in top_eval_obj_dict.keys()]
+    ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+    Ys_eval = torch.tensor([eval_label_inital]*20).reshape(-1, 1)
+    eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, top_20_genes)
+    eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+    for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+        print(len(eval_lengths))
+    pred_label_eval_list = []
+    pn_cls_checkpoint.to(device)
+    for eval_idx in range(len(eval_lengths)):
+            eval_length = eval_lengths[eval_idx]
+            if eval_length <= 1:
+                continue
+            else:
+                input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+                cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+                pred_label_eval = cls_eval
+                pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+    pred_res_top[str(dup) + '_copy'] = np.vstack(pred_label_eval_list)
+
+
+for dup in [1,2,3,4,5,10,25,50,100,250,500]:
+    bottom_eval_obj_dict = {}
+    for key in bottom20.keys():
+        temp_eval_mtx = np.vstack([eval_obj_initial['human'],
+                        np.repeat(bottom20[key], repeats=dup, axis=0)])
+        bottom_eval_obj_dict['human_' + key] = temp_eval_mtx
+    Xs_eval = [torch.tensor(bottom_eval_obj_dict[k]) for k in bottom_eval_obj_dict.keys()]
+    ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+    Ys_eval = torch.tensor([eval_label_inital]*100).reshape(-1, 1)
+    eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, bottom_20_genes)
+    eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+    for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+        print(len(eval_lengths))
+    pred_label_eval_list = []
+    pn_cls_checkpoint.to(device)
+    for eval_idx in range(len(eval_lengths)):
+            eval_length = eval_lengths[eval_idx]
+            if eval_length <= 1:
+                continue
+            else:
+                input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+                cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+                pred_label_eval = cls_eval
+                pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+    pred_res_bottom[str(dup) + '_copy'] = np.vstack(pred_label_eval_list)
+
+
+
+
+
+
+
+pred_res_top['0_copy'] = 2.950235605239868
+pred_res_bottom['0_copy'] = 2.950235605239868
+
+
+
+
+x_labels = pred_res_top.columns
+x_values = [int(label.split('_')[0]) for label in x_labels]
+x_labels_ = pred_res_bottom.columns
+x_values_ = [int(label.split('_')[0]) for label in x_labels_]
+
+fig = plt.figure(figsize=(12, 8))
+
+for i in range(pred_res_bottom.shape[0]):
+    plt.plot(x_values_, pred_res_bottom.iloc[i], marker='o', c='grey', alpha=0.5)
+
+for i in range(pred_res_top.shape[0]):
+    plt.plot(x_values, pred_res_top.iloc[i], marker='o', c='r')
+
+sns.despine()
+plt.tight_layout()
+plt.show()
+fig.savefig('test_.pdf')
+
+
+
+
+
+
+
+
+WDR81_emb
+[eval_obj[k] for k in eval_obj.keys()][0].shape
+# ([13969, 320])
+np.vstack([WDR81_emb,[eval_obj[k] for k in eval_obj.keys()][0]]).shape
+# (13970, 320)
+np.vstack([np.repeat(WDR81_emb, repeats=10, axis=0),[eval_obj[k] for k in eval_obj.keys()][0]]).shape
+# (13979, 320)
+
+
+# add 1
+Xs_eval = [torch.tensor(np.vstack([WDR81_emb, eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_1_copy'] = pred_label_eval_df.values
+
+
+
+# add 2
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=2, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_2_copy'] = pred_label_eval_df.values
+
+
+
+
+# add 5
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=5, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_5_copy'] = pred_label_eval_df.values
+
+
+
+
+
+# add 10
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=10, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_10_copy'] = pred_label_eval_df.values
+
+
+
+
+
+# add 20
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=20, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_20_copy'] = pred_label_eval_df.values
+
+
+
+# add 50
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=50, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_50_copy'] = pred_label_eval_df.values
+
+
+
+
+# add 100
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=100, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_100_copy'] = pred_label_eval_df.values
+
+
+
+# add 200
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=200, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_200_copy'] = pred_label_eval_df.values
+
+
+# add 500
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=500, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_500_copy'] = pred_label_eval_df.values
+
+
+
+
+# add 1000
+Xs_eval = [torch.tensor(np.vstack([np.repeat(WDR81_emb, repeats=1000, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_1000_copy'] = pred_label_eval_df.values
+
+
+
+filtered_pred_label.to_csv('seed_9_duplication_UP000005640_Human_Q562E7_WDR81.csv')
+filtered_true_label.to_csv('seed_9_true.csv')
+
+# Disease	                    Brain effect
+# Cerebellar atrophy	        Shrinkage of the cerebellum (part of brain controlling movement and balance)
+# Congenital hydrocephalus	    Enlarged brain ventricles due to fluid buildup
+# Microcephaly-like syndromes	Smaller than normal brain size
+
+# Loss of function mutations in WDR81 lead to severely reduced brain size, especially in the cerebellum.
+# In mouse models, Wdr81 mutations cause defects in neuronal survival and brain volume loss.
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+df = filtered_pred_label.copy()
+x_labels = ['original'] + [col for col in df.columns if col.startswith('add_')]
+x = list(range(len(x_labels)))  # 0, 1, 2, ...
+os.makedirs('plots_per_species', exist_ok=True)
+
+# Version 1: One PDF per species
+for idx, row in df.iterrows():
+    species_name = row['species']
+    y = [row['brainsize']] + [row[col] for col in df.columns if col.startswith('add_')]
+    plt.figure(figsize=(8, 6))
+    plt.plot(x, y, marker='o')
+    plt.xticks(x, x_labels, rotation=45, ha='right')
+    plt.title(f'Brain Size Change - {species_name}')
+    plt.xlabel('Number of Added Copies')
+    plt.ylabel('Brain Size (Prediction)')
+    plt.grid(True)
+    safe_species_name = species_name.replace('/', '_')  # Handle weird characters
+    plt.tight_layout()
+    plt.savefig(f'plots_per_species/{safe_species_name}.pdf')
+    plt.close()
+
+
+
+# Version 2: All species on one figure
+plt.figure(figsize=(15, 12))
+for idx, row in df.iterrows():
+    species_name = row['species']
+    y = [row['brainsize']] + [row[col] for col in df.columns if col.startswith('add_')]
+    plt.plot(x, y, marker='o', label=species_name)
+
+plt.xticks(x, x_labels, rotation=45, ha='right')
+plt.title('Brain Size Change Across Species')
+plt.xlabel('Number of Added Copies')
+plt.ylabel('Brain Size (Prediction)')
+plt.grid(True)
+plt.legend(fontsize=5, bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig('brain_size_all_species.pdf')
+plt.close()
+
+
+
+
+
+# control
+# Q9Y6J3                    0.016481        human     SMA5O
+
+human_df[human_df.gene_name=='KRA54'] # Q9Y6J3
+# Q6L8H1                    0.011898        human     KRA54
+if "Q6L8H1" in attention_mtx_df.index:
+    row_number = attention_mtx_df.index.get_loc("Q6L8H1")
+    print(row_number)
+    # 893747
+
+attention_mtx_df.iloc[row_number,:]
+# attention_score_raw                      0.000001
+# attention_score_zscore                  -0.456565
+# attention_score_norm_norm                0.016481
+# species_id                            UP000005640
+# species_name                                human
+# species_Uniprot_name         homo sapiens (human)
+SMA5O_emb = instance_mtx[row_number].copy()
+SMA5O_emb = SMA5O_emb.reshape(1,-1)
+
+
+
+SMA5O_emb
+[eval_obj[k] for k in eval_obj.keys()][0].shape
+# ([13969, 320])
+np.vstack([SMA5O_emb,[eval_obj[k] for k in eval_obj.keys()][0]]).shape
+# (13970, 320)
+np.vstack([np.repeat(SMA5O_emb, repeats=10, axis=0),[eval_obj[k] for k in eval_obj.keys()][0]]).shape
+# (13979, 320)
+
+
+# add 1
+Xs_eval = [torch.tensor(np.vstack([SMA5O_emb, eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_1_copy'] = pred_label_eval_df.values
+
+
+
+# add 2
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=2, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_2_copy'] = pred_label_eval_df.values
+
+
+
+
+# add 5
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=5, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_5_copy'] = pred_label_eval_df.values
+
+
+
+
+
+# add 10
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=10, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_10_copy'] = pred_label_eval_df.values
+
+
+
+
+
+# add 20
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=20, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_20_copy'] = pred_label_eval_df.values
+
+
+
+# add 50
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=50, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_50_copy'] = pred_label_eval_df.values
+
+
+
+
+# add 100
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=100, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_100_copy'] = pred_label_eval_df.values
+
+
+
+# add 200
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=200, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_200_copy'] = pred_label_eval_df.values
+
+
+# add 500
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=500, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_500_copy'] = pred_label_eval_df.values
+
+
+
+
+# add 1000
+Xs_eval = [torch.tensor(np.vstack([np.repeat(SMA5O_emb, repeats=1000, axis=0), eval_obj[k]])) for k in eval_obj.keys()]
+Ys_eval = torch.tensor(filtered_true_label.brainsize.tolist()).reshape(-1, 1)
+ins_eval = [Xs_eval[i].shape[0] for i in range(len(Xs_eval))]
+eval_dataset = MILDataset(Xs_eval, Ys_eval, ins_eval, species_keys)
+eval_loader = DataLoader(eval_dataset, batch_size=len(ins_eval), shuffle=False, collate_fn=MIL_Collate_fn)
+for eval_padded_bags, eval_labels, eval_lengths, eval_id in eval_loader:
+    print(len(eval_lengths))
+
+
+pred_label_eval_list = []
+pn_cls_checkpoint.to(device)
+for eval_idx in range(len(eval_lengths)):
+        eval_length = eval_lengths[eval_idx]
+        if eval_length <= 1:
+            continue
+        else:
+            input_eval = eval_padded_bags[eval_idx, :eval_length,:].unsqueeze(0).permute(0, 2, 1)
+            cls_eval, _, _, _, _ = pn_cls_checkpoint(input_eval)
+            pred_label_eval = cls_eval
+            pred_label_eval_list.append(pred_label_eval.detach().cpu().numpy())
+
+
+pred_label_eval_df = pd.DataFrame(np.vstack(pred_label_eval_list), columns=['brainsize'], index=eval_id)
+pred_label_eval_df
+filtered_pred_label['add_1000_copy'] = pred_label_eval_df.values
+
+
+
+filtered_pred_label.to_csv('seed_9_duplication_UP000005640_Human_Q9Y6J3_SMA5O_emb_ctrl.csv')
+filtered_true_label.to_csv('seed_9_true.csv')
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+df = filtered_pred_label.copy()
+x_labels = ['original'] + [col for col in df.columns if col.startswith('add_')]
+x = list(range(len(x_labels)))  # 0, 1, 2, ...
+os.makedirs('plots_per_species', exist_ok=True)
+
+# Version 1: One PDF per species
+for idx, row in df.iterrows():
+    species_name = row['species']
+    y = [row['brainsize']] + [row[col] for col in df.columns if col.startswith('add_')]
+    plt.figure(figsize=(8, 6))
+    plt.plot(x, y, marker='o')
+    plt.xticks(x, x_labels, rotation=45, ha='right')
+    plt.title(f'Brain Size Change - {species_name}')
+    plt.xlabel('Number of Added Copies')
+    plt.ylabel('Brain Size (Prediction)')
+    plt.grid(True)
+    safe_species_name = species_name.replace('/', '_')  # Handle weird characters
+    plt.tight_layout()
+    plt.savefig(f'plots_per_species/{safe_species_name}.pdf')
+    plt.close()
+
+
+
+# Version 2: All species on one figure
+plt.figure(figsize=(15, 12))
+for idx, row in df.iterrows():
+    species_name = row['species']
+    y = [row['brainsize']] + [row[col] for col in df.columns if col.startswith('add_')]
+    plt.plot(x, y, marker='o', label=species_name)
+
+plt.xticks(x, x_labels, rotation=45, ha='right')
+plt.title('Brain Size Change Across Species')
+plt.xlabel('Number of Added Copies')
+plt.ylabel('Brain Size (Prediction)')
+plt.grid(True)
+plt.legend(fontsize=5, bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig('brain_size_all_species.pdf')
+plt.close()
+
+
+
+
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+# Load the file
+df = pd.read_csv('/group/gquongrp/workspaces/hongruhu/bioPointNet/organism_level/low_attn_ctrl/seed_9_duplication_UP000005640_Human_Q9Y6J3_SMA5O_emb_ctrl.csv', 
+                 index_col=0)
+
+# Create output folder
+os.makedirs('plots_per_species', exist_ok=True)
+# Prepare x-axis based on actual number of copies added
+x_mapping = {'brainsize': 0}
+for col in df.columns:
+    if col.startswith('add_'):
+        # Extract number from column name like 'add_5_copy'
+        copy_num = int(col.split('_')[1])
+        x_mapping[col] = copy_num
+
+
+# x-axis values (sorted by increasing copy number)
+x_labels = list(x_mapping.keys())
+x_values = [x_mapping[label] for label in x_labels]
+
+
+# Version 2: all species together
+plt.figure(figsize=(15, 12))
+
+for idx, row in df.iterrows():
+    species_name = row['species']
+    y = [row['brainsize']] + [row[col] for col in df.columns if col.startswith('add_')]
+    plt.plot(x_values, y, marker='o', label=species_name)
+
+plt.xticks(x_values)
+plt.title('Brain Size Change Across Species')
+plt.xlabel('Number of Added Copies')
+plt.ylabel('Brain Size (Prediction)')
+plt.grid(True)
+plt.legend(fontsize=5, bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig('brain_size_all_species_corrected_xaxis_pos.pdf')
+plt.close()
+
+
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+# Load the file
+df = pd.read_csv('/group/gquongrp/workspaces/hongruhu/bioPointNet/organism_level/high_attn/seed_9_duplication_UP000005640_Human_Q562E7_WDR81.csv', 
+                 index_col=0)
+
+# Prepare x-axis based on actual number of copies added
+x_mapping = {'brainsize': 0}
+for col in df.columns:
+    if col.startswith('add_'):
+        # Extract number from column name like 'add_5_copy'
+        copy_num = int(col.split('_')[1])
+        x_mapping[col] = copy_num
+
+
+# x-axis values (sorted by increasing copy number)
+x_labels = list(x_mapping.keys())
+x_values = [x_mapping[label] for label in x_labels]
+
+
+# Version 2: all species together
+plt.figure(figsize=(15, 12))
+
+for idx, row in df.iterrows():
+    species_name = row['species']
+    y = [row['brainsize']] + [row[col] for col in df.columns if col.startswith('add_')]
+    plt.plot(x_values, y, marker='o', label=species_name)
+
+plt.xticks(x_values)
+plt.title('Brain Size Change Across Species')
+plt.xlabel('Number of Added Copies')
+plt.ylabel('Brain Size (Prediction)')
+plt.grid(True)
+plt.legend(fontsize=5, bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig('brain_size_all_species_corrected_xaxis_neg.pdf')
+plt.close()
+
